@@ -25,10 +25,24 @@ import (
 const defaultPacketQueueCapacity = 64
 const maximumPacketIngressBatch = 32
 
+const (
+	// DefaultGuestCallTimeout bounds a single call into a guest. The core
+	// never blocks inside a call, so one that runs this long is stuck.
+	DefaultGuestCallTimeout = 30 * time.Second
+	// guestWatchdogExitCode is the exit code of a guest closed by the
+	// watchdog, after the conventional exit status of timeout(1).
+	guestWatchdogExitCode = 124
+)
+
 type Options struct {
 	Services            platform.Services
 	PacketQueueCapacity int
 	Management          reactor.ManagementHandler
+	// GuestCallTimeout is how long a call into a guest may run before the
+	// host closes that guest, ending its instance or WebClient with an
+	// error. Zero means DefaultGuestCallTimeout; a negative value disables
+	// the watchdog.
+	GuestCallTimeout time.Duration
 }
 
 // Host owns the wazero runtime and the compiled core. Every instance and the
@@ -72,8 +86,16 @@ func NewHost(ctx context.Context, options Options) (_ *Host, err error) {
 		return nil, fmt.Errorf("packet queue capacity must be positive")
 	}
 
+	if options.GuestCallTimeout == 0 {
+		options.GuestCallTimeout = DefaultGuestCallTimeout
+	}
+
 	lifetime, cancel := context.WithCancel(contextutil.WithoutCancel(ctx))
-	runtime := wazero.NewRuntime(lifetime)
+	// Termination checks let the watchdog stop a guest that loops forever.
+	// Guest calls run with a context that is never done, so they cost no
+	// watcher per call; the checks run every 1024 loop iterations.
+	runtime := wazero.NewRuntimeWithConfig(lifetime, wazero.NewRuntimeConfig().
+		WithCloseOnContextDone(options.GuestCallTimeout > 0))
 	var compiled wazero.CompiledModule
 	defer func() {
 		if err == nil {
@@ -109,7 +131,45 @@ func NewHost(ctx context.Context, options Options) (_ *Host, err error) {
 		instances: make(map[*Instance]struct{}),
 		closeDone: make(chan struct{}),
 	}
+	if options.GuestCallTimeout > 0 {
+		go host.runWatchdog(options.GuestCallTimeout)
+	}
 	return host, nil
+}
+
+type watchedGuest interface {
+	guestBusyFor(now time.Duration) time.Duration
+	terminateGuest(cause error)
+}
+
+// runWatchdog closes guests whose current call has been running longer than
+// timeout.
+func (host *Host) runWatchdog(timeout time.Duration) {
+	ticker := time.NewTicker(min(max(timeout/4, 10*time.Millisecond), time.Second))
+	defer ticker.Stop()
+	var guests []watchedGuest
+	for {
+		select {
+		case <-host.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		guests = guests[:0]
+		host.mu.Lock()
+		for instance := range host.instances {
+			guests = append(guests, instance)
+		}
+		if host.webClient != nil {
+			guests = append(guests, host.webClient)
+		}
+		host.mu.Unlock()
+		now := time.Since(watchdogEpoch)
+		for _, guest := range guests {
+			if busy := guest.guestBusyFor(now); busy > timeout {
+				guest.terminateGuest(fmt.Errorf("EasyTier guest call did not return within %s; the guest was closed", timeout))
+			}
+		}
+	}
 }
 
 // guestEnvironment is one isolated core module instance and the host side it
@@ -245,6 +305,7 @@ func (host *Host) CreateInstance(
 	instance := &Instance{
 		host:              host,
 		ctx:               lifetime,
+		guestCtx:          contextutil.WithoutCancel(lifetime),
 		cancel:            cancel,
 		core:              core,
 		dataPlane:         core,

@@ -167,7 +167,7 @@ func (instance *Instance) handleRPCCommand(
 	switch request.kind {
 	case rpcSubmit:
 		operation, err := instance.rpc.SubmitRPC(
-			instance.ctx,
+			instance.guestContext(),
 			request.request,
 		)
 		if err != nil {
@@ -184,7 +184,7 @@ func (instance *Instance) handleRPCCommand(
 			return rpcCommandResponse{}
 		}
 		if err := instance.rpc.FreeRPCOperation(
-			instance.ctx,
+			instance.guestContext(),
 			request.operation,
 		); err != nil {
 			return rpcCommandResponse{err: err}
@@ -205,7 +205,7 @@ func (instance *Instance) takeRPCResponses() error {
 	}
 	for operation, pending := range instance.pendingRPCs {
 		response, ready, err := instance.rpc.TakeRPCResponse(
-			instance.ctx,
+			instance.guestContext(),
 			operation,
 		)
 		if err != nil {

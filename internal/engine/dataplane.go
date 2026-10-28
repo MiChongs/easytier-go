@@ -307,7 +307,7 @@ func (instance *Instance) handleDataPlaneCommand(
 	defer instance.guestMu.Unlock()
 	switch request.kind {
 	case dataPlaneSubmit:
-		operation, err := request.submit(instance.ctx, instance.dataPlane)
+		operation, err := request.submit(instance.guestContext(), instance.dataPlane)
 		if err != nil {
 			return dataPlaneCommandResponse{err: err}
 		}
@@ -326,21 +326,21 @@ func (instance *Instance) handleDataPlaneCommand(
 		}
 		return dataPlaneCommandResponse{
 			err: instance.dataPlane.CancelOperation(
-				instance.ctx,
+				instance.guestContext(),
 				request.operation,
 			),
 		}
 	case dataPlaneCloseResource:
 		return dataPlaneCommandResponse{
 			err: instance.dataPlane.CloseResource(
-				instance.ctx,
+				instance.guestContext(),
 				request.resource,
 			),
 		}
 	case dataPlaneSetDeadline:
 		return dataPlaneCommandResponse{
 			err: instance.dataPlane.SetResourceDeadline(
-				instance.ctx,
+				instance.guestContext(),
 				request.resource,
 				request.direction,
 				resourceDeadlineTimeoutMillis(request.deadline),
@@ -358,7 +358,7 @@ func (instance *Instance) drainDataPlaneCompletions() (bool, error) {
 		return false, nil
 	}
 	completions, err := instance.dataPlane.DrainCompletions(
-		instance.ctx,
+		instance.guestContext(),
 		dataPlaneCompletionBatch,
 	)
 	if err != nil {
@@ -381,7 +381,7 @@ func (instance *Instance) drainDataPlaneCompletions() (bool, error) {
 			)
 		}
 		result, resultErr := instance.dataPlane.TakeResult(
-			instance.ctx,
+			instance.guestContext(),
 			completion,
 		)
 		if err := validateCompletionResult(completion, resultErr); err != nil {

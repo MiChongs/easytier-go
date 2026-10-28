@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/easytier/easytier/easytier-go/proto/common"
 
@@ -34,6 +35,11 @@ const (
 type Options struct {
 	Platform            platform.Services
 	PacketQueueCapacity int
+	// GuestCallTimeout is how long one call into the embedded core may run
+	// before the host closes the guest it runs in, ending that instance or
+	// WebClient with an error. Zero means 30 seconds; a negative value
+	// disables the watchdog.
+	GuestCallTimeout time.Duration
 }
 
 type EmbeddedCoreInfo struct {
@@ -78,6 +84,7 @@ func New(ctx context.Context, options Options) (*Host, error) {
 			Services:            mergeServices(options.Platform),
 			PacketQueueCapacity: options.PacketQueueCapacity,
 			Management:          manager.handle,
+			GuestCallTimeout:    options.GuestCallTimeout,
 		},
 	)
 	if err != nil {

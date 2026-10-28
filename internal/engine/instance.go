@@ -84,9 +84,10 @@ func (journal *eventJournal) snapshot() []string {
 }
 
 type Instance struct {
-	host   *Host
-	ctx    context.Context
-	cancel context.CancelFunc
+	host     *Host
+	ctx      context.Context
+	guestCtx context.Context
+	cancel   context.CancelFunc
 
 	core        guestCore
 	dataPlane   dataPlaneCore
@@ -94,11 +95,13 @@ type Instance struct {
 	environment *guestEnvironment
 	reactor     *reactor.Reactor
 	// guestMu serializes calls into this instance's guest module.
-	guestMu    sync.Mutex
-	packetSink uint64
-	eventSink  uint64
-	events     chan Event
-	journal    *eventJournal
+	guestMu       guestLock
+	watchdogOnce  sync.Once
+	watchdogCause atomic.Pointer[error]
+	packetSink    uint64
+	eventSink     uint64
+	events        chan Event
+	journal       *eventJournal
 
 	commands          chan command
 	dataPlaneCommands chan dataPlaneCommand
@@ -118,6 +121,17 @@ type Instance struct {
 
 	errMu       sync.Mutex
 	terminalErr error
+}
+
+// guestContext is the context of calls into the guest. It carries the values
+// of the instance context but is never done: a guest call is not abandoned
+// half way, and wazero needs no watcher per call when termination is
+// enforced. A stuck guest is stopped by the host's watchdog instead.
+func (instance *Instance) guestContext() context.Context {
+	if instance.guestCtx != nil {
+		return instance.guestCtx
+	}
+	return contextutil.WithoutCancel(instance.ctx)
 }
 
 func (instance *Instance) Start(ctx context.Context) error {
@@ -312,10 +326,34 @@ func (instance *Instance) run() {
 	instance.failPendingOperations(net.ErrClosed)
 	instance.failPendingRPCs(net.ErrClosed)
 	cleanupErr := instance.shutdown()
+	var watchdogErr error
+	if cause := instance.watchdogCause.Load(); cause != nil {
+		watchdogErr = *cause
+	}
 	instance.errMu.Lock()
-	instance.terminalErr = errors.Join(runErr, cleanupErr)
+	instance.terminalErr = errors.Join(watchdogErr, runErr, cleanupErr)
 	instance.errMu.Unlock()
 	close(instance.done)
+}
+
+func (instance *Instance) guestBusyFor(now time.Duration) time.Duration {
+	return instance.guestMu.busyFor(now)
+}
+
+// terminateGuest closes the guest module of an instance whose guest call does
+// not return. The call stops at its next termination check and the instance
+// ends with cause.
+func (instance *Instance) terminateGuest(cause error) {
+	instance.watchdogOnce.Do(func() {
+		instance.watchdogCause.Store(&cause)
+		if instance.environment != nil {
+			_ = instance.environment.module.CloseWithExitCode(context.Background(), guestWatchdogExitCode)
+		}
+		// End the drive loop even if no further guest call would fail.
+		if instance.cancel != nil {
+			instance.cancel()
+		}
+	})
 }
 
 func (instance *Instance) driveLoop() error {
@@ -323,8 +361,9 @@ func (instance *Instance) driveLoop() error {
 	timer := time.NewTimer(time.Hour)
 	stopTimer(timer)
 	defer stopTimer(timer)
+	var idleDrives zeroDeadlineGuard
 	for {
-		timerChannel := deadlineTimer(timer, deadline)
+		timerChannel := deadlineTimer(timer, idleDrives.deadline(deadline))
 		select {
 		case request := <-instance.commands:
 			stopTimer(timer)
@@ -404,6 +443,8 @@ func (instance *Instance) driveLoop() error {
 				return err
 			}
 			deadline = next
+			idleDrives.timerDrive(next)
+			continue
 		case <-instance.closeRequested:
 			stopTimer(timer)
 			return nil
@@ -411,6 +452,7 @@ func (instance *Instance) driveLoop() error {
 			stopTimer(timer)
 			return instance.ctx.Err()
 		}
+		idleDrives.reset()
 	}
 }
 
@@ -479,13 +521,13 @@ drain:
 // the guest accepted any, with the first error.
 func (instance *Instance) sendPacketsLocked(request command) (bool, error) {
 	if request.packets == nil {
-		err := instance.core.SendPacket(instance.ctx, request.packet)
+		err := instance.core.SendPacket(instance.guestContext(), request.packet)
 		return err == nil, err
 	}
 	sent := false
 	var firstErr error
 	for _, packet := range request.packets {
-		if err := instance.core.SendPacket(instance.ctx, packet); err != nil {
+		if err := instance.core.SendPacket(instance.guestContext(), packet); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -501,11 +543,11 @@ func (instance *Instance) handleCommand(request command) error {
 	defer instance.guestMu.Unlock()
 	switch request.kind {
 	case commandStart:
-		return instance.core.Start(instance.ctx)
+		return instance.core.Start(instance.guestContext())
 	case commandStop:
-		return instance.core.Stop(instance.ctx)
+		return instance.core.Stop(instance.guestContext())
 	case commandSendPacket:
-		return instance.core.SendPacket(instance.ctx, request.packet)
+		return instance.core.SendPacket(instance.guestContext(), request.packet)
 	default:
 		return fmt.Errorf("unknown EasyTier command %d", request.kind)
 	}
@@ -515,11 +557,11 @@ func (instance *Instance) drive(notify bool) (int64, error) {
 	instance.guestMu.Lock()
 	defer instance.guestMu.Unlock()
 	if notify {
-		if err := instance.core.NotifyCompletions(instance.ctx); err != nil {
+		if err := instance.core.NotifyCompletions(instance.guestContext()); err != nil {
 			return 0, err
 		}
 	}
-	state, err := instance.core.Drive(instance.ctx)
+	state, err := instance.core.Drive(instance.guestContext())
 	if err != nil {
 		return 0, err
 	}
@@ -537,7 +579,7 @@ func (instance *Instance) drive(notify bool) (int64, error) {
 	if err := instance.takeRPCResponses(); err != nil {
 		return 0, err
 	}
-	deadline, err := instance.core.NextDeadline(instance.ctx)
+	deadline, err := instance.core.NextDeadline(instance.guestContext())
 	if err != nil {
 		return 0, err
 	}

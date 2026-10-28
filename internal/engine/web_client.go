@@ -21,12 +21,15 @@ type WebClientOptions struct {
 }
 
 type WebClient struct {
-	host        *Host
-	ctx         context.Context
-	cancel      context.CancelFunc
-	core        *coreabi.WebClient
-	environment *guestEnvironment
-	guestMu     sync.Mutex
+	host          *Host
+	ctx           context.Context
+	guestCtx      context.Context
+	cancel        context.CancelFunc
+	core          *coreabi.WebClient
+	environment   *guestEnvironment
+	guestMu       guestLock
+	watchdogOnce  sync.Once
+	watchdogCause atomic.Pointer[error]
 
 	completions    <-chan struct{}
 	closeRequested chan struct{}
@@ -80,6 +83,7 @@ func (host *Host) CreateWebClient(
 	client := &WebClient{
 		host:           host,
 		ctx:            lifetime,
+		guestCtx:       contextutil.WithoutCancel(lifetime),
 		cancel:         cancel,
 		core:           core,
 		environment:    environment,
@@ -115,8 +119,12 @@ func (client *WebClient) Close(ctx context.Context) error {
 func (client *WebClient) run() {
 	runErr := client.driveLoop()
 	cleanupErr := client.shutdown()
+	var watchdogErr error
+	if cause := client.watchdogCause.Load(); cause != nil {
+		watchdogErr = *cause
+	}
 	client.errMu.Lock()
-	client.terminalErr = errors.Join(runErr, cleanupErr)
+	client.terminalErr = errors.Join(watchdogErr, runErr, cleanupErr)
 	client.errMu.Unlock()
 	close(client.done)
 }
@@ -126,6 +134,7 @@ func (client *WebClient) driveLoop() error {
 	timer := time.NewTimer(0)
 	stopTimer(timer)
 	defer stopTimer(timer)
+	var idleDrives zeroDeadlineGuard
 	for {
 		select {
 		case <-client.completions:
@@ -135,12 +144,14 @@ func (client *WebClient) driveLoop() error {
 				return err
 			}
 			deadline = next
-		case <-deadlineTimer(timer, deadline):
+			idleDrives.reset()
+		case <-deadlineTimer(timer, idleDrives.deadline(deadline)):
 			next, err := client.drive(false)
 			if err != nil {
 				return err
 			}
 			deadline = next
+			idleDrives.timerDrive(next)
 		case <-client.closeRequested:
 			return nil
 		case <-client.ctx.Done():
@@ -153,19 +164,19 @@ func (client *WebClient) drive(notify bool) (int64, error) {
 	client.guestMu.Lock()
 	defer client.guestMu.Unlock()
 	if notify {
-		if err := client.core.NotifyCompletions(client.ctx); err != nil {
+		if err := client.core.NotifyCompletions(client.guestCtx); err != nil {
 			return 0, err
 		}
 	}
-	if err := client.core.Drive(client.ctx); err != nil {
+	if err := client.core.Drive(client.guestCtx); err != nil {
 		return 0, err
 	}
-	connected, err := client.core.IsConnected(client.ctx)
+	connected, err := client.core.IsConnected(client.guestCtx)
 	if err != nil {
 		return 0, err
 	}
 	client.connected.Store(connected)
-	return client.core.NextDeadline(client.ctx)
+	return client.core.NextDeadline(client.guestCtx)
 }
 
 func (client *WebClient) shutdown() error {
@@ -188,4 +199,18 @@ func (client *WebClient) terminalError() error {
 	client.errMu.Lock()
 	defer client.errMu.Unlock()
 	return client.terminalErr
+}
+
+func (client *WebClient) guestBusyFor(now time.Duration) time.Duration {
+	return client.guestMu.busyFor(now)
+}
+
+// terminateGuest closes the guest module of a WebClient whose guest call does
+// not return.
+func (client *WebClient) terminateGuest(cause error) {
+	client.watchdogOnce.Do(func() {
+		client.watchdogCause.Store(&cause)
+		_ = client.environment.module.CloseWithExitCode(context.Background(), guestWatchdogExitCode)
+		client.cancel()
+	})
 }
