@@ -181,13 +181,14 @@ func (reactor *Reactor) StartUDPReceive(handle, operation uint64) error {
 	}
 	reactor.udpReads[operation] = waiter
 	state.readWaiters[operation] = waiter
+	ready := waiter.ready
 	startWorker := reactor.startUDPReceiveLocked(state)
 	reactor.mu.Unlock()
 
 	if startWorker {
 		go reactor.runUDPReceive(handle, state)
 	}
-	if waiter.ready {
+	if ready {
 		reactor.signalCompletion()
 	}
 	return nil

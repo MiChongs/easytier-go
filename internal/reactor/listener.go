@@ -30,7 +30,8 @@ func (reactor *Reactor) StartTCPAccept(handle, operation uint64) error {
 		ready:  len(state.accepted) > 0 || state.acceptErr != nil,
 	}
 	reactor.accepts[operation] = waiter
-	startWorker := !waiter.ready && !state.acceptRunning
+	ready := waiter.ready
+	startWorker := !ready && !state.acceptRunning
 	if startWorker {
 		state.acceptRunning = true
 		reactor.workers.Add(1)
@@ -40,7 +41,7 @@ func (reactor *Reactor) StartTCPAccept(handle, operation uint64) error {
 	if startWorker {
 		go reactor.runTCPAccept(handle, state)
 	}
-	if waiter.ready {
+	if ready {
 		reactor.signalCompletion()
 	}
 	return nil
