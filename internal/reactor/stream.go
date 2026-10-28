@@ -13,8 +13,11 @@ type streamState struct {
 	readQueue   []*readOperation
 	readRunning bool
 	readReady   bool
-	readData    []byte
-	readErr     error
+	// readBuffer is the pooled buffer readData points into. It is held only
+	// while read data waits for the guest, so idle streams hold none.
+	readBuffer []byte
+	readData   []byte
+	readErr    error
 
 	writeQueue   []*writeOperation
 	writeRunning bool
@@ -98,12 +101,17 @@ func (reactor *Reactor) runStreamRead(
 	stream *streamState,
 ) {
 	defer reactor.workers.Done()
-	buffer := make([]byte, capacity)
+	buffer := getBuffer(int(capacity))
 	n, err := stream.connection.Read(buffer)
 
 	reactor.mu.Lock()
 	stream.readRunning = false
-	stream.readData = append(stream.readData[:0], buffer[:n]...)
+	if n > 0 {
+		stream.readBuffer = buffer
+		stream.readData = buffer[:n]
+	} else {
+		putBuffer(buffer)
+	}
 	stream.readErr = err
 	stream.readReady = true
 	ready := len(stream.readQueue) > 0
@@ -113,38 +121,57 @@ func (reactor *Reactor) runStreamRead(
 	}
 }
 
+// TakeRead completes a read and returns a copy of its data.
 func (reactor *Reactor) TakeRead(operation uint64) ([]byte, error) {
+	var data []byte
+	_, err := reactor.TakeReadInto(operation, func(read []byte) error {
+		data = append([]byte(nil), read...)
+		return nil
+	})
+	return data, err
+}
+
+// TakeReadInto completes a read by passing its data to deliver, which must
+// copy it out before returning: the buffer is reused once deliver returns.
+// It returns the number of bytes delivered. An error from deliver is
+// returned after the read is consumed.
+func (reactor *Reactor) TakeReadInto(operation uint64, deliver func([]byte) error) (int, error) {
 	reactor.mu.Lock()
 	waiter, exists := reactor.reads[operation]
 	if !exists || reactor.operations[operation] != operationRead {
 		reactor.mu.Unlock()
-		return nil, ErrInvalid
+		return 0, ErrInvalid
 	}
 	stream := waiter.stream
 	if len(stream.readQueue) == 0 || stream.readQueue[0] != waiter {
 		reactor.mu.Unlock()
-		return nil, ErrPending
+		return 0, ErrPending
 	}
 	if !stream.readAvailableLocked() {
 		reactor.mu.Unlock()
-		return nil, ErrPending
+		return 0, ErrPending
 	}
 
-	var data []byte
-	var err error
+	var (
+		taken      int
+		err        error
+		deliverErr error
+	)
 	if stream.readReady {
-		take := len(stream.readData)
-		if take > int(waiter.capacity) {
-			take = int(waiter.capacity)
-		}
-		data = append([]byte(nil), stream.readData[:take]...)
-		if take == len(stream.readData) {
+		taken = min(len(stream.readData), int(waiter.capacity))
+		// Deliver before the next read can reuse the buffer.
+		deliverErr = deliver(stream.readData[:taken])
+		if taken == len(stream.readData) {
+			if stream.readBuffer != nil {
+				putBuffer(stream.readBuffer)
+				stream.readBuffer = nil
+			}
 			stream.readData = nil
 			err = stream.readErr
 			stream.readErr = nil
 			stream.readReady = false
 		} else {
-			stream.readData = stream.readData[take:]
+			stream.readData = stream.readData[taken:]
 		}
 	} else {
 		err = net.ErrClosed
@@ -168,7 +195,10 @@ func (reactor *Reactor) TakeRead(operation uint64) ([]byte, error) {
 	if errors.Is(err, io.EOF) {
 		err = nil
 	}
-	return data, err
+	if deliverErr != nil {
+		return taken, deliverErr
+	}
+	return taken, err
 }
 
 func (reactor *Reactor) cancelStreamReadLocked(
@@ -211,15 +241,17 @@ func (stream *streamState) readAvailableLocked() bool {
 }
 
 func (reactor *Reactor) StartWrite(handle, operation uint64, data []byte) error {
-	data = append([]byte(nil), data...)
+	data = append(getBuffer(len(data))[:0], data...)
 	reactor.mu.Lock()
 	stream, exists := reactor.streams[handle]
 	if !exists {
 		reactor.mu.Unlock()
+		putBuffer(data)
 		return ErrInvalid
 	}
 	if err := reactor.claimOperationLocked(operation, operationWrite); err != nil {
 		reactor.mu.Unlock()
+		putBuffer(data)
 		return err
 	}
 	request := &writeOperation{
@@ -277,6 +309,7 @@ func (reactor *Reactor) runStreamWrites(stream *streamState) {
 			}
 		}
 
+		putBuffer(data)
 		reactor.mu.Lock()
 		stream.writeActive = nil
 		request.data = nil
@@ -318,6 +351,7 @@ func (reactor *Reactor) cancelStreamWriteLocked(operation uint64) {
 		return
 	}
 	request.stream.writeQueue = removeWriteOperation(request.stream.writeQueue, request)
+	putBuffer(request.data)
 	request.data = nil
 }
 
@@ -344,6 +378,7 @@ func (reactor *Reactor) closeStreamLocked(stream *streamState) bool {
 	stream.closed = true
 	ready := len(stream.readQueue) > 0 && stream.readAvailableLocked()
 	for _, request := range stream.writeQueue {
+		putBuffer(request.data)
 		request.data = nil
 		if reactor.writes[request.operation] != request {
 			continue

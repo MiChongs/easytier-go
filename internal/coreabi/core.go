@@ -34,7 +34,13 @@ type Core struct {
 	dataPlaneOutput      uint32
 	dataPlaneOutputSize  uint32
 	dropped              bool
+	// stack holds the parameters and result of the current guest call. Calls
+	// into one core are serialized by the engine, so the stack is reused
+	// instead of allocating the variadic parameters of every call.
+	stack [maxGuestParameters]uint64
 }
+
+const maxGuestParameters = 8
 
 type guestFunction struct {
 	call           api.Function
@@ -423,7 +429,7 @@ func (core *Core) callOne(
 	if err != nil {
 		return 0, err
 	}
-	return callGuestFunction(ctx, name, function, params)
+	return core.callGuest(ctx, name, function, params)
 }
 
 func (core *Core) callCached(
@@ -439,7 +445,7 @@ func (core *Core) callCached(
 		}
 		*cached = function
 	}
-	return callGuestFunction(ctx, name, *cached, params)
+	return core.callGuest(ctx, name, *cached, params)
 }
 
 func (core *Core) resolveFunction(name string) (guestFunction, error) {
@@ -469,7 +475,7 @@ func (core *Core) resolveFunction(name string) (guestFunction, error) {
 	return function, nil
 }
 
-func callGuestFunction(
+func (core *Core) callGuest(
 	ctx context.Context,
 	name string,
 	function guestFunction,
@@ -483,11 +489,11 @@ func callGuestFunction(
 			len(params),
 		)
 	}
-
-	stack := params
-	if len(stack) == 0 {
-		stack = make([]uint64, 1)
+	if len(params) > len(core.stack) {
+		return 0, fmt.Errorf("%s takes %d params, more than %d", name, len(params), len(core.stack))
 	}
+	stack := core.stack[:max(len(params), 1)]
+	copy(stack, params)
 	if err := function.call.CallWithStack(ctx, stack); err != nil {
 		return 0, fmt.Errorf("%s: %w", name, err)
 	}

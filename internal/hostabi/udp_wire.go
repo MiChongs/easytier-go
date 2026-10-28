@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"net/netip"
 )
 
 const udpMetadataLen = 48
@@ -119,4 +120,64 @@ func allZero(values []byte) bool {
 		}
 	}
 	return true
+}
+
+// encodeUDPPeerMetadata encodes a peer without optional fields, like
+// encodeUDPMetadata(peer, nil, 0), without allocating. An IPv4-mapped IPv6
+// address is encoded as IPv4, as net.IP.To4 does.
+func encodeUDPPeerMetadata(peer netip.AddrPort) ([udpMetadataLen]byte, error) {
+	var metadata [udpMetadataLen]byte
+	address := peer.Addr()
+	switch {
+	case address.Is4() || address.Is4In6():
+		metadata[0] = 4
+		ipv4 := address.Unmap().As4()
+		copy(metadata[1:5], ipv4[:])
+	case address.Is6():
+		metadata[0] = 6
+		ipv6 := address.As16()
+		copy(metadata[1:17], ipv6[:])
+		if zone := address.Zone(); zone != "" {
+			iface, err := net.InterfaceByName(zone)
+			if err != nil {
+				return metadata, err
+			}
+			binary.BigEndian.PutUint32(metadata[23:27], uint32(iface.Index))
+		}
+	default:
+		return metadata, errors.New("invalid UDP peer IP")
+	}
+	binary.BigEndian.PutUint16(metadata[17:19], peer.Port())
+	return metadata, nil
+}
+
+// decodeUDPPeerMetadata decodes metadata that carries only a peer, the form
+// try_udp_send accepts, without allocating for addresses without a zone.
+func decodeUDPPeerMetadata(metadata []byte) (netip.AddrPort, error) {
+	if len(metadata) != udpMetadataLen {
+		return netip.AddrPort{}, errors.New("invalid UDP metadata length")
+	}
+	if metadata[27] != 0 || !allZero(metadata[28:48]) || !allZero(metadata[19:23]) {
+		return netip.AddrPort{}, errors.New("UDP send metadata carries optional fields")
+	}
+	port := binary.BigEndian.Uint16(metadata[17:19])
+	switch metadata[0] {
+	case 4:
+		if !allZero(metadata[5:17]) || !allZero(metadata[19:27]) {
+			return netip.AddrPort{}, errors.New("noncanonical IPv4 peer metadata")
+		}
+		return netip.AddrPortFrom(netip.AddrFrom4([4]byte(metadata[1:5])), port), nil
+	case 6:
+		address := netip.AddrFrom16([16]byte(metadata[1:17]))
+		if scopeID := binary.BigEndian.Uint32(metadata[23:27]); scopeID != 0 {
+			iface, err := net.InterfaceByIndex(int(scopeID))
+			if err != nil {
+				return netip.AddrPort{}, err
+			}
+			address = address.WithZone(iface.Name)
+		}
+		return netip.AddrPortFrom(address, port), nil
+	default:
+		return netip.AddrPort{}, errors.New("invalid UDP peer family")
+	}
 }

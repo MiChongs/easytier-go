@@ -107,7 +107,7 @@ func New(parent context.Context, options Options) *Reactor {
 		reactor.streams[handle] = newStreamState(connection)
 	}
 	for handle, connection := range options.InitialDatagrams {
-		state := newDatagramState(connection)
+		state := newDatagramState(handle, connection)
 		reactor.datagrams[handle] = state
 		reactor.workers.Add(1)
 		go reactor.runUDPSends(handle, state)
@@ -169,9 +169,9 @@ func (reactor *Reactor) CancelOperation(id uint64) error {
 	case operationWrite:
 		reactor.cancelStreamWriteLocked(id)
 	case operationUDPRead:
-		delete(reactor.udpReads, id)
+		reactor.forgetUDPReadLocked(id, reactor.udpReads[id])
 	case operationUDPWrite:
-		delete(reactor.udpWrites, id)
+		reactor.forgetUDPWriteLocked(id, reactor.udpWrites[id])
 	case operationAccept:
 		delete(reactor.accepts, id)
 	case operationCreate:
@@ -194,7 +194,7 @@ func (reactor *Reactor) CancelOperation(id uint64) error {
 			cancel = operation.cancel
 		}
 	case operationPacketWrite:
-		delete(reactor.packetWrites, id)
+		reactor.forgetPacketWriteLocked(id, reactor.packetWrites[id])
 	case operationManagement:
 		operation := reactor.management[id]
 		delete(reactor.management, id)

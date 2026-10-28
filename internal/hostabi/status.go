@@ -53,3 +53,7 @@ func connectStatus(err error) int32 {
 		return statusIOError
 	}
 }
+
+// errGuestMemory reports, from a reactor delivery callback, that the guest
+// buffer could not take the data.
+var errGuestMemory = errors.New("guest memory access out of bounds")

@@ -206,7 +206,7 @@ func (reactor *Reactor) TakeUDPBind(operation uint64) (BoundResult, error) {
 		return BoundResult{}, err
 	}
 	handle := reactor.allocateHandleLocked()
-	state := newDatagramState(create.datagram)
+	state := newDatagramState(handle, create.datagram)
 	reactor.datagrams[handle] = state
 	result := BoundResult{Handle: handle, Local: create.localAddr}
 	create.datagram = nil

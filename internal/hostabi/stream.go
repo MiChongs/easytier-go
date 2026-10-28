@@ -2,6 +2,7 @@ package hostabi
 
 import (
 	"context"
+	"errors"
 
 	"github.com/metacubex/wazero/api"
 )
@@ -84,17 +85,22 @@ func (adapter *Adapter) takeRead(
 	destination uint32,
 	capacity uint32,
 ) int32 {
-	data, err := adapter.reactor.TakeRead(operation)
+	n, err := adapter.reactor.TakeReadInto(operation, func(data []byte) error {
+		if uint32(len(data)) > capacity {
+			return errGuestMemory
+		}
+		if len(data) > 0 && !module.Memory().Write(destination, data) {
+			return errGuestMemory
+		}
+		return nil
+	})
+	if errors.Is(err, errGuestMemory) {
+		return statusMemory
+	}
 	if err != nil {
 		return operationStatus(err)
 	}
-	if uint32(len(data)) > capacity {
-		return statusMemory
-	}
-	if len(data) > 0 && !module.Memory().Write(destination, data) {
-		return statusMemory
-	}
-	return int32(len(data))
+	return int32(n)
 }
 
 func (adapter *Adapter) startWrite(

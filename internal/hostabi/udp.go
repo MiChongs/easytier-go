@@ -2,6 +2,7 @@ package hostabi
 
 import (
 	"context"
+	"net/netip"
 
 	"github.com/metacubex/wazero/api"
 )
@@ -122,21 +123,30 @@ func (adapter *Adapter) takeUDPReceive(
 	if _, ok := module.Memory().Read(metadataDestination, metadataLength); !ok {
 		return statusMemory
 	}
-	datagram, err := adapter.reactor.TakeUDPReceive(operation, capacity)
+	var status int32
+	n, err := adapter.reactor.TakeUDPReceiveInto(operation, capacity, func(data []byte, peer netip.AddrPort) error {
+		if len(data) > 0 && !module.Memory().Write(destination, data) {
+			status = statusMemory
+			return errGuestMemory
+		}
+		metadata, encodeErr := encodeUDPPeerMetadata(peer)
+		if encodeErr != nil {
+			status = statusInvalid
+			return encodeErr
+		}
+		if !module.Memory().Write(metadataDestination, metadata[:]) {
+			status = statusMemory
+			return errGuestMemory
+		}
+		return nil
+	})
+	if status != 0 {
+		return status
+	}
 	if err != nil {
 		return operationStatus(err)
 	}
-	if len(datagram.Data) > 0 && !module.Memory().Write(destination, datagram.Data) {
-		return statusMemory
-	}
-	metadata, err := encodeUDPMetadata(datagram.Peer, nil, 0)
-	if err != nil {
-		return statusInvalid
-	}
-	if !module.Memory().Write(metadataDestination, metadata[:]) {
-		return statusMemory
-	}
-	return int32(len(datagram.Data))
+	return int32(n)
 }
 
 func (adapter *Adapter) tryUDPSend(
@@ -155,15 +165,15 @@ func (adapter *Adapter) tryUDPSend(
 	if !ok {
 		return statusMemory
 	}
-	peer, sourceIP, flowinfo, sourceIfindex, err := decodeUDPMetadata(metadata)
-	if err != nil || sourceIP != nil || flowinfo != 0 || sourceIfindex != 0 {
+	peer, err := decodeUDPPeerMetadata(metadata)
+	if err != nil {
 		return statusInvalid
 	}
 	data, ok := module.Memory().Read(source, length)
 	if !ok {
 		return statusMemory
 	}
-	return operationStatus(adapter.reactor.TryUDPSend(handle, data, peer))
+	return operationStatus(adapter.reactor.TryUDPSendAddrPort(handle, data, peer))
 }
 
 func (adapter *Adapter) startUDPSendReady(
