@@ -575,7 +575,7 @@ func TestPublicCreateInstanceAcceptsSecureModeConfig(t *testing.T) {
 }
 
 func instanceConfig(
-	t *testing.T,
+	t testing.TB,
 	id int,
 	ipv4 string,
 	port int,
@@ -657,7 +657,7 @@ func (factory *recordingSocketFactory) ListenTCP(
 	return listener, nil
 }
 
-func (factory *recordingSocketFactory) listenerPort(t *testing.T) int {
+func (factory *recordingSocketFactory) listenerPort(t testing.TB) int {
 	t.Helper()
 	factory.mu.Lock()
 	defer factory.mu.Unlock()

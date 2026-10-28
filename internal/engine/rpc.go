@@ -162,8 +162,8 @@ func (instance *Instance) freeRPCAndWait(
 func (instance *Instance) handleRPCCommand(
 	request rpcCommand,
 ) rpcCommandResponse {
-	instance.host.guestMu.Lock()
-	defer instance.host.guestMu.Unlock()
+	instance.guestMu.Lock()
+	defer instance.guestMu.Unlock()
 	switch request.kind {
 	case rpcSubmit:
 		operation, err := instance.rpc.SubmitRPC(

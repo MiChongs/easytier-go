@@ -81,10 +81,13 @@ type Instance struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	core       guestCore
-	dataPlane  dataPlaneCore
-	rpc        rpcCore
-	reactor    *reactor.Reactor
+	core        guestCore
+	dataPlane   dataPlaneCore
+	rpc         rpcCore
+	environment *guestEnvironment
+	reactor     *reactor.Reactor
+	// guestMu serializes calls into this instance's guest module.
+	guestMu    sync.Mutex
 	packetSink uint64
 	eventSink  uint64
 	events     chan Event
@@ -95,7 +98,7 @@ type Instance struct {
 	rpcCommands       chan rpcCommand
 	pendingOperations map[coreabi.OperationID]*pendingOperation
 	pendingRPCs       map[coreabi.RPCOperationID]*pendingRPC
-	completions       chan struct{}
+	completions       <-chan struct{}
 	closeRequested    chan struct{}
 	closeOnce         sync.Once
 	closing           atomic.Bool
@@ -422,8 +425,8 @@ drain:
 }
 
 func (instance *Instance) handleCommand(request command) error {
-	instance.host.guestMu.Lock()
-	defer instance.host.guestMu.Unlock()
+	instance.guestMu.Lock()
+	defer instance.guestMu.Unlock()
 	switch request.kind {
 	case commandStart:
 		return instance.core.Start(instance.ctx)
@@ -437,8 +440,8 @@ func (instance *Instance) handleCommand(request command) error {
 }
 
 func (instance *Instance) drive(notify bool) (int64, error) {
-	instance.host.guestMu.Lock()
-	defer instance.host.guestMu.Unlock()
+	instance.guestMu.Lock()
+	defer instance.guestMu.Unlock()
 	if notify {
 		if err := instance.core.NotifyCompletions(instance.ctx); err != nil {
 			return 0, err
@@ -478,15 +481,21 @@ func (instance *Instance) shutdown() error {
 		5*time.Second,
 	)
 	defer cancel()
-	instance.host.guestMu.Lock()
+	instance.guestMu.Lock()
 	dropErr := instance.core.Drop(cleanupContext)
-	instance.host.guestMu.Unlock()
+	instance.guestMu.Unlock()
 	instance.reactor.UnregisterPacketSink(instance.packetSink)
 	instance.reactor.UnregisterEventSink(instance.eventSink)
 	close(instance.events)
 	instance.cancel()
+	// Closing the environment also closes every socket the guest opened,
+	// including those a failed Drop would leave behind.
+	var environmentErr error
+	if instance.environment != nil {
+		environmentErr = instance.environment.close()
+	}
 	instance.host.removeInstance(instance)
-	return dropErr
+	return errors.Join(dropErr, environmentErr)
 }
 
 func (instance *Instance) finishedError(operation string) error {

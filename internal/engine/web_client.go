@@ -21,12 +21,14 @@ type WebClientOptions struct {
 }
 
 type WebClient struct {
-	host   *Host
-	ctx    context.Context
-	cancel context.CancelFunc
-	core   *coreabi.WebClient
+	host        *Host
+	ctx         context.Context
+	cancel      context.CancelFunc
+	core        *coreabi.WebClient
+	environment *guestEnvironment
+	guestMu     sync.Mutex
 
-	completions    chan struct{}
+	completions    <-chan struct{}
 	closeRequested chan struct{}
 	closeOnce      sync.Once
 	done           chan struct{}
@@ -59,13 +61,18 @@ func (host *Host) CreateWebClient(
 	if host.webClient != nil {
 		return nil, fmt.Errorf("EasyTier WebClient is already running")
 	}
-	host.guestMu.Lock()
-	core, err := coreabi.NewWebClient(host.module)
+	// host.mu is held only to keep a single WebClient; instances created by
+	// the configuration server take host.mu after the client is running.
+	environment, err := host.newGuestEnvironment(ctx)
+	if err != nil {
+		return nil, err
+	}
+	core, err := coreabi.NewWebClient(environment.module)
 	if err == nil {
 		err = core.Create(ctx, envelope)
 	}
-	host.guestMu.Unlock()
 	if err != nil {
+		_ = environment.close()
 		return nil, err
 	}
 
@@ -75,7 +82,8 @@ func (host *Host) CreateWebClient(
 		ctx:            lifetime,
 		cancel:         cancel,
 		core:           core,
-		completions:    make(chan struct{}, 1),
+		environment:    environment,
+		completions:    environment.reactor.Completions(),
 		closeRequested: make(chan struct{}),
 		done:           make(chan struct{}),
 	}
@@ -142,8 +150,8 @@ func (client *WebClient) driveLoop() error {
 }
 
 func (client *WebClient) drive(notify bool) (int64, error) {
-	client.host.guestMu.Lock()
-	defer client.host.guestMu.Unlock()
+	client.guestMu.Lock()
+	defer client.guestMu.Unlock()
 	if notify {
 		if err := client.core.NotifyCompletions(client.ctx); err != nil {
 			return 0, err
@@ -166,13 +174,14 @@ func (client *WebClient) shutdown() error {
 		5*time.Second,
 	)
 	defer cancel()
-	client.host.guestMu.Lock()
+	client.guestMu.Lock()
 	err := client.core.Drop(cleanupContext)
-	client.host.guestMu.Unlock()
+	client.guestMu.Unlock()
 	client.connected.Store(false)
 	client.cancel()
+	environmentErr := client.environment.close()
 	client.host.removeWebClient(client)
-	return err
+	return errors.Join(err, environmentErr)
 }
 
 func (client *WebClient) terminalError() error {

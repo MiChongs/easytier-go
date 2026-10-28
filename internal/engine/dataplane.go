@@ -303,8 +303,8 @@ func (instance *Instance) setDataPlaneResourceDeadline(
 func (instance *Instance) handleDataPlaneCommand(
 	request dataPlaneCommand,
 ) dataPlaneCommandResponse {
-	instance.host.guestMu.Lock()
-	defer instance.host.guestMu.Unlock()
+	instance.guestMu.Lock()
+	defer instance.guestMu.Unlock()
 	switch request.kind {
 	case dataPlaneSubmit:
 		operation, err := request.submit(instance.ctx, instance.dataPlane)

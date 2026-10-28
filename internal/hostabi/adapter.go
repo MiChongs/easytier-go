@@ -6,9 +6,11 @@ import (
 
 	"github.com/easytier/easytier/easytier-go/internal/reactor"
 	"github.com/metacubex/wazero"
+	"github.com/metacubex/wazero/api"
 )
 
-const importModule = "easytier_host"
+// ImportModule is the module name the EasyTier core imports its host ABI from.
+const ImportModule = "easytier_host"
 
 type Adapter struct {
 	reactor *reactor.Reactor
@@ -22,11 +24,14 @@ func New(runtime *reactor.Reactor) (*Adapter, error) {
 	return &Adapter{reactor: runtime}, nil
 }
 
-func (adapter *Adapter) Instantiate(ctx context.Context, runtime wazero.Runtime) error {
+// Instantiate instantiates the host ABI bound to the adapter's reactor as the
+// host module name. Each guest links to its own host module, so the operation
+// IDs a guest chooses are scoped to the guest's reactor.
+func (adapter *Adapter) Instantiate(ctx context.Context, runtime wazero.Runtime, name string) (api.Module, error) {
 	if runtime == nil {
-		return fmt.Errorf("instantiate host ABI with nil wazero runtime")
+		return nil, fmt.Errorf("instantiate host ABI with nil wazero runtime")
 	}
-	_, err := runtime.NewHostModuleBuilder(importModule).
+	return runtime.NewHostModuleBuilder(name).
 		NewFunctionBuilder().
 		WithGoModuleFunction(
 			adapter.emitEventFunction(),
@@ -153,5 +158,4 @@ func (adapter *Adapter) Instantiate(ctx context.Context, runtime wazero.Runtime)
 		NewFunctionBuilder().WithFunc(adapter.cancelOperation).Export("cancel_operation").
 		NewFunctionBuilder().WithFunc(adapter.closeHandle).Export("close").
 		Instantiate(ctx)
-	return err
 }

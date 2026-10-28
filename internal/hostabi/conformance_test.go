@@ -433,7 +433,7 @@ func instantiateProbe(
 	if err != nil {
 		t.Fatalf("create host ABI adapter: %v", err)
 	}
-	if err := adapter.Instantiate(ctx, runtime); err != nil {
+	if _, err := adapter.Instantiate(ctx, runtime, ImportModule); err != nil {
 		t.Fatalf("instantiate host ABI: %v", err)
 	}
 	wasi_snapshot_preview1.MustInstantiate(ctx, runtime)

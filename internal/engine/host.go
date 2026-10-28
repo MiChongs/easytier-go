@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/easytier/easytier/easytier-go/internal/artifact"
@@ -17,6 +18,7 @@ import (
 	"github.com/easytier/easytier/easytier-go/platform"
 	"github.com/metacubex/wazero"
 	"github.com/metacubex/wazero/api"
+	"github.com/metacubex/wazero/experimental"
 	"github.com/metacubex/wazero/imports/wasi_snapshot_preview1"
 )
 
@@ -29,16 +31,21 @@ type Options struct {
 	Management          reactor.ManagementHandler
 }
 
+// Host owns the wazero runtime and the compiled core. Every instance and the
+// WebClient run in a guest environment of their own: a core module instance
+// with its own linear memory, host ABI module and reactor. Guests therefore
+// execute in parallel, an operation ID chosen by one guest cannot collide with
+// another's, a trap ends only the guest it happened in, and closing a guest
+// releases every host resource it opened.
 type Host struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	runtime wazero.Runtime
-	module  api.Module
-	reactor *reactor.Reactor
-	options Options
+	runtime  wazero.Runtime
+	compiled wazero.CompiledModule
+	options  Options
 
-	guestMu sync.Mutex
+	nextGuest atomic.Uint64
 
 	mu        sync.Mutex
 	closed    bool
@@ -67,18 +74,14 @@ func NewHost(ctx context.Context, options Options) (_ *Host, err error) {
 
 	lifetime, cancel := context.WithCancel(contextutil.WithoutCancel(ctx))
 	runtime := wazero.NewRuntime(lifetime)
-	var module api.Module
-	var hostReactor *reactor.Reactor
+	var compiled wazero.CompiledModule
 	defer func() {
 		if err == nil {
 			return
 		}
 		cancel()
-		if module != nil {
-			_ = module.Close(contextutil.WithoutCancel(ctx))
-		}
-		if hostReactor != nil {
-			hostReactor.Close()
+		if compiled != nil {
+			_ = compiled.Close(contextutil.WithoutCancel(ctx))
 		}
 		_ = runtime.Close(contextutil.WithoutCancel(ctx))
 	}()
@@ -86,25 +89,9 @@ func NewHost(ctx context.Context, options Options) (_ *Host, err error) {
 	if _, err = wasi_snapshot_preview1.Instantiate(ctx, runtime); err != nil {
 		return nil, fmt.Errorf("instantiate WASI preview1: %w", err)
 	}
-	hostReactor = reactor.New(lifetime, reactor.Options{
-		Services:   options.Services,
-		Management: options.Management,
-	})
-	adapter, err := hostabi.New(hostReactor)
-	if err != nil {
-		return nil, err
-	}
-	if err = adapter.Instantiate(ctx, runtime); err != nil {
-		return nil, fmt.Errorf("instantiate EasyTier host ABI: %w", err)
-	}
-	compiled, err := runtime.CompileModule(ctx, artifact.Core())
+	compiled, err = runtime.CompileModule(ctx, artifact.Core())
 	if err != nil {
 		return nil, fmt.Errorf("compile embedded EasyTier core: %w", err)
-	}
-	defer compiled.Close(contextutil.WithoutCancel(ctx))
-	module, err = runtime.InstantiateModule(ctx, compiled, newModuleConfig())
-	if err != nil {
-		return nil, fmt.Errorf("instantiate embedded EasyTier core: %w", err)
 	}
 	// Compiling the core allocates ~100MB of throwaway compiler state on the
 	// Go heap. The Go runtime does not return it to the OS on its own after
@@ -117,14 +104,74 @@ func NewHost(ctx context.Context, options Options) (_ *Host, err error) {
 		ctx:       lifetime,
 		cancel:    cancel,
 		runtime:   runtime,
-		module:    module,
-		reactor:   hostReactor,
+		compiled:  compiled,
 		options:   options,
 		instances: make(map[*Instance]struct{}),
 		closeDone: make(chan struct{}),
 	}
-	go host.broadcastCompletions()
 	return host, nil
+}
+
+// guestEnvironment is one isolated core module instance and the host side it
+// talks to.
+type guestEnvironment struct {
+	reactor    *reactor.Reactor
+	hostModule api.Module
+	module     api.Module
+}
+
+func (host *Host) newGuestEnvironment(ctx context.Context) (_ *guestEnvironment, err error) {
+	id := host.nextGuest.Add(1)
+	environment := &guestEnvironment{
+		reactor: reactor.New(host.ctx, reactor.Options{
+			Services:   host.options.Services,
+			Management: host.options.Management,
+		}),
+	}
+	defer func() {
+		if err != nil {
+			environment.close()
+		}
+	}()
+	adapter, err := hostabi.New(environment.reactor)
+	if err != nil {
+		return nil, err
+	}
+	environment.hostModule, err = adapter.Instantiate(ctx, host.runtime, fmt.Sprintf("%s_%d", hostabi.ImportModule, id))
+	if err != nil {
+		return nil, fmt.Errorf("instantiate EasyTier host ABI: %w", err)
+	}
+	hostModule := environment.hostModule
+	linkCtx := experimental.WithImportResolver(ctx, func(name string) api.Module {
+		if name == hostabi.ImportModule {
+			return hostModule
+		}
+		return nil
+	})
+	environment.module, err = host.runtime.InstantiateModule(
+		linkCtx,
+		host.compiled,
+		newModuleConfig().WithName(fmt.Sprintf("easytier_core_%d", id)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("instantiate embedded EasyTier core: %w", err)
+	}
+	return environment, nil
+}
+
+// close releases the guest and every host resource it opened.
+func (environment *guestEnvironment) close() error {
+	cleanupContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var closeErrors []error
+	if environment.module != nil {
+		closeErrors = append(closeErrors, environment.module.Close(cleanupContext))
+	}
+	environment.reactor.Close()
+	if environment.hostModule != nil {
+		closeErrors = append(closeErrors, environment.hostModule.Close(cleanupContext))
+	}
+	return errors.Join(closeErrors...)
 }
 
 func newModuleConfig() wazero.ModuleConfig {
@@ -151,17 +198,26 @@ func (host *Host) CreateInstance(
 	}
 
 	host.mu.Lock()
-	defer host.mu.Unlock()
-	if host.closed {
+	closed := host.closed
+	host.mu.Unlock()
+	if closed {
 		return nil, fmt.Errorf("create instance with closed EasyTier engine host")
 	}
-	packetSink, err := host.reactor.RegisterPacketSink(host.options.PacketQueueCapacity)
+	// The guest is created without host.mu: other guests keep running while
+	// this one initializes.
+	environment, err := host.newGuestEnvironment(ctx)
 	if err != nil {
+		return nil, err
+	}
+	instanceReactor := environment.reactor
+	packetSink, err := instanceReactor.RegisterPacketSink(host.options.PacketQueueCapacity)
+	if err != nil {
+		_ = environment.close()
 		return nil, fmt.Errorf("register EasyTier packet sink: %w", err)
 	}
 	events := make(chan Event, instanceEventQueueCapacity)
 	journal := newEventJournal()
-	eventSink, err := host.reactor.RegisterEventSink(func(kind, message string) bool {
+	eventSink, err := instanceReactor.RegisterEventSink(func(kind, message string) bool {
 		journal.add(kind, message)
 		select {
 		case events <- Event{Kind: kind, Message: message}:
@@ -171,20 +227,17 @@ func (host *Host) CreateInstance(
 		}
 	})
 	if err != nil {
-		host.reactor.UnregisterPacketSink(packetSink)
 		close(events)
+		_ = environment.close()
 		return nil, fmt.Errorf("register EasyTier event sink: %w", err)
 	}
-	host.guestMu.Lock()
-	core, err := coreabi.New(host.module)
+	core, err := coreabi.New(environment.module)
 	if err == nil {
 		err = core.Create(ctx, envelope, packetSink, eventSink)
 	}
-	host.guestMu.Unlock()
 	if err != nil {
-		host.reactor.UnregisterPacketSink(packetSink)
-		host.reactor.UnregisterEventSink(eventSink)
 		close(events)
+		_ = environment.close()
 		return nil, err
 	}
 
@@ -196,7 +249,8 @@ func (host *Host) CreateInstance(
 		core:              core,
 		dataPlane:         core,
 		rpc:               core,
-		reactor:           host.reactor,
+		environment:       environment,
+		reactor:           instanceReactor,
 		packetSink:        packetSink,
 		eventSink:         eventSink,
 		events:            events,
@@ -210,14 +264,24 @@ func (host *Host) CreateInstance(
 		pendingRPCs: make(
 			map[coreabi.RPCOperationID]*pendingRPC,
 		),
-		completions:    make(chan struct{}, 1),
+		completions:    instanceReactor.Completions(),
 		closeRequested: make(chan struct{}),
 		done:           make(chan struct{}),
 		running:        make(chan struct{}),
 		stopped:        make(chan struct{}),
 	}
 	instance.state.Store(int32(coreabi.StateCreated))
+	host.mu.Lock()
+	if host.closed {
+		host.mu.Unlock()
+		cancel()
+		close(events)
+		_ = core.Drop(contextutil.WithoutCancel(ctx))
+		_ = environment.close()
+		return nil, fmt.Errorf("create instance with closed EasyTier engine host")
+	}
 	host.instances[instance] = struct{}{}
+	host.mu.Unlock()
 	go instance.run()
 	return instance, nil
 }
@@ -265,42 +329,17 @@ func (host *Host) shutdown(webClient *WebClient, instances []*Instance) {
 	}
 
 	host.cancel()
-	host.reactor.Close()
 	cleanupContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	moduleErr := host.module.Close(cleanupContext)
+	compiledErr := host.compiled.Close(cleanupContext)
 	runtimeErr := host.runtime.Close(cleanupContext)
 
 	host.mu.Lock()
 	host.closeErr = errors.Join(
-		append(closeErrors, moduleErr, runtimeErr)...,
+		append(closeErrors, compiledErr, runtimeErr)...,
 	)
 	host.mu.Unlock()
 	close(host.closeDone)
-}
-
-func (host *Host) broadcastCompletions() {
-	for {
-		select {
-		case <-host.reactor.Completions():
-			host.mu.Lock()
-			if host.webClient != nil {
-				select {
-				case host.webClient.completions <- struct{}{}:
-				default:
-				}
-			}
-			for instance := range host.instances {
-				select {
-				case instance.completions <- struct{}{}:
-				default:
-				}
-			}
-			host.mu.Unlock()
-		case <-host.ctx.Done():
-			return
-		}
-	}
 }
 
 func (host *Host) removeWebClient(client *WebClient) {
