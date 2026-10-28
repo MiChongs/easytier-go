@@ -92,3 +92,88 @@ func BenchmarkPublicPacketThroughput(b *testing.B) {
 	<-receiverDone
 	b.ReportMetric(float64(delivered.Load())/float64(b.N)*100, "%delivered")
 }
+
+// BenchmarkPublicPacketThroughputBatch is BenchmarkPublicPacketThroughput
+// with SendPackets batches of 32 and ReceivePackets with ReleasePacket.
+func BenchmarkPublicPacketThroughputBatch(b *testing.B) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	client, server := connectedPair(b, ctx)
+	packet := ipv4Packet(net.IPv4(10, 144, 0, 2), net.IPv4(10, 144, 0, 1), make([]byte, 1200))
+	batch := make([][]byte, 32)
+	for index := range batch {
+		batch[index] = packet
+	}
+	var delivered atomic.Int64
+	receiveCtx, stopReceive := context.WithCancel(ctx)
+	receiverDone := make(chan struct{})
+	go func() {
+		defer close(receiverDone)
+		received := make([][]byte, 64)
+		for {
+			n, err := server.ReceivePackets(receiveCtx, received)
+			if err != nil {
+				return
+			}
+			for _, packet := range received[:n] {
+				corehost.ReleasePacket(packet)
+			}
+			delivered.Add(int64(n))
+		}
+	}()
+	b.SetBytes(int64(len(packet) * len(batch)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := client.SendPackets(ctx, batch); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	time.Sleep(200 * time.Millisecond)
+	stopReceive()
+	<-receiverDone
+	b.ReportMetric(float64(delivered.Load())/float64(b.N*len(batch))*100, "%delivered")
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*len(batch)), "ns/packet")
+}
+
+func TestPublicPacketBatchesArriveIntact(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	client, server := connectedPair(t, ctx)
+	const count = 48
+	batch := make([][]byte, count)
+	for index := range batch {
+		payload := make([]byte, 64+index)
+		for offset := range payload {
+			payload[offset] = byte(index)
+		}
+		batch[index] = ipv4Packet(net.IPv4(10, 144, 0, 2), net.IPv4(10, 144, 0, 1), payload)
+	}
+	if err := client.SendPackets(ctx, batch); err != nil {
+		t.Fatalf("send batch: %v", err)
+	}
+	seen := make(map[int]bool)
+	received := make([][]byte, 16)
+	for len(seen) < count {
+		receiveCtx, stop := context.WithTimeout(ctx, 5*time.Second)
+		n, err := server.ReceivePackets(receiveCtx, received)
+		stop()
+		if err != nil {
+			t.Fatalf("receive after %d packets: %v", len(seen), err)
+		}
+		for _, packet := range received[:n] {
+			// A probe of connectedPair may still arrive late.
+			if string(packet[20:]) == "probe" {
+				corehost.ReleasePacket(packet)
+				continue
+			}
+			index := len(packet) - 20 - 64
+			if index < 0 || index >= count || string(packet) != string(batch[index]) {
+				t.Fatalf("unexpected packet of %d bytes", len(packet))
+			}
+			seen[index] = true
+			corehost.ReleasePacket(packet)
+		}
+	}
+}

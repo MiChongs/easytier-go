@@ -14,6 +14,7 @@ import (
 	"github.com/easytier/easytier/easytier-go/internal/contextutil"
 	"github.com/easytier/easytier/easytier-go/internal/coreabi"
 	"github.com/easytier/easytier/easytier-go/internal/engine"
+	"github.com/easytier/easytier/easytier-go/internal/reactor"
 	"github.com/easytier/easytier/easytier-go/platform"
 	"github.com/easytier/easytier/easytier-go/platform/netstd"
 	hostproto "github.com/easytier/easytier/easytier-go/proto"
@@ -243,11 +244,39 @@ func (instance *Instance) SendPacket(ctx context.Context, packet []byte) error {
 	return instance.engine.SendPacket(ctx, packet)
 }
 
+// SendPackets submits a batch of IP packets in one guest turn, which is much
+// cheaper per packet than SendPacket. The packets may be reused once it
+// returns. It returns the first error; the remaining packets are still sent.
+func (instance *Instance) SendPackets(ctx context.Context, packets [][]byte) error {
+	if instance == nil || instance.engine == nil {
+		return fmt.Errorf("send packets through nil EasyTier instance")
+	}
+	return instance.engine.SendPackets(ctx, packets)
+}
+
 func (instance *Instance) ReceivePacket(ctx context.Context) ([]byte, error) {
 	if instance == nil || instance.engine == nil {
 		return nil, fmt.Errorf("receive packet from nil EasyTier instance")
 	}
 	return instance.engine.ReceivePacket(ctx)
+}
+
+// ReceivePackets waits for at least one packet and fills packets with as many
+// queued packets as fit, returning how many it stored. The packets belong to
+// the caller; handing them back with ReleasePacket lets the host reuse their
+// buffers.
+func (instance *Instance) ReceivePackets(ctx context.Context, packets [][]byte) (int, error) {
+	if instance == nil || instance.engine == nil {
+		return 0, fmt.Errorf("receive packets from nil EasyTier instance")
+	}
+	return instance.engine.ReceivePackets(ctx, packets)
+}
+
+// ReleasePacket returns a packet from ReceivePacket or ReceivePackets to the
+// host's buffer pool. The packet must not be used afterwards. Releasing is
+// optional; unreleased packets are garbage collected.
+func ReleasePacket(packet []byte) {
+	reactor.ReleasePacket(packet)
 }
 
 // Events returns the instance's bounded event stream.

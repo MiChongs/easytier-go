@@ -34,3 +34,9 @@ func New(ctx context.Context, options Options) (*Host, error) {
 func CoreInfo() EmbeddedCoreInfo {
 	return internalhost.CoreInfo()
 }
+
+// ReleasePacket returns a packet received from an Instance to the host's
+// buffer pool. The packet must not be used afterwards.
+func ReleasePacket(packet []byte) {
+	internalhost.ReleasePacket(packet)
+}

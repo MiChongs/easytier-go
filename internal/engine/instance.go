@@ -24,10 +24,17 @@ const (
 )
 
 type command struct {
-	kind     commandKind
-	packet   []byte
+	kind   commandKind
+	packet []byte
+	// packets carries a batch of packets for commandSendPacket in place of
+	// packet.
+	packets  [][]byte
 	response chan error
 }
+
+// responses recycles the reply channels of commands. A channel is reused only
+// after its reply was received, so a late reply cannot reach another caller.
+var responses = sync.Pool{New: func() any { return make(chan error, 1) }}
 
 type guestCore interface {
 	Start(context.Context) error
@@ -160,6 +167,42 @@ func (instance *Instance) SendPacket(ctx context.Context, packet []byte) error {
 	})
 }
 
+// SendPackets submits a batch of IP packets in one guest turn. The guest may
+// read the packets until SendPackets returns. It returns the first error of a
+// packet the guest rejected or of the turn; other packets are still sent.
+func (instance *Instance) SendPackets(ctx context.Context, packets [][]byte) error {
+	if ctx == nil {
+		return fmt.Errorf("send EasyTier packets with nil context")
+	}
+	if len(packets) == 0 {
+		return nil
+	}
+	for _, packet := range packets {
+		if len(packet) == 0 {
+			return fmt.Errorf("send empty packet")
+		}
+	}
+	return instance.execute(ctx, command{
+		kind:    commandSendPacket,
+		packets: packets,
+	})
+}
+
+// ReceivePackets waits for at least one packet and fills packets with the
+// queued ones that fit. The packets belong to the caller, which may hand them
+// back with reactor.ReleasePacket.
+func (instance *Instance) ReceivePackets(ctx context.Context, packets [][]byte) (int, error) {
+	if ctx == nil {
+		return 0, fmt.Errorf("receive EasyTier packets with nil context")
+	}
+	select {
+	case <-instance.done:
+		return 0, instance.finishedError("receive EasyTier packets")
+	default:
+	}
+	return instance.reactor.ReceivePackets(ctx, instance.packetSink, packets)
+}
+
 func (instance *Instance) ReceivePacket(ctx context.Context) ([]byte, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("receive EasyTier packet with nil context")
@@ -222,31 +265,37 @@ func (instance *Instance) execute(ctx context.Context, request command) error {
 	if ctx == nil {
 		return fmt.Errorf("execute EasyTier command with nil context")
 	}
-	request.response = make(chan error, 1)
 	if instance.closing.Load() {
 		return fmt.Errorf("execute EasyTier command on closing instance")
 	}
+	response := responses.Get().(chan error)
+	request.response = response
 	select {
 	case instance.commands <- request:
 	case <-instance.done:
+		responses.Put(response)
 		return instance.finishedError("execute EasyTier command")
 	case <-instance.closeRequested:
+		responses.Put(response)
 		return fmt.Errorf("execute EasyTier command on closing instance")
 	case <-ctx.Done():
+		responses.Put(response)
 		return ctx.Err()
 	}
 	if request.kind == commandSendPacket {
 		// The guest may retain packet until it responds. Do not let caller
 		// cancellation end the borrow after the request enters the queue.
 		select {
-		case err := <-request.response:
+		case err := <-response:
+			responses.Put(response)
 			return err
 		case <-instance.done:
 			return instance.finishedError("execute EasyTier command")
 		}
 	}
 	select {
-	case err := <-request.response:
+	case err := <-response:
+		responses.Put(response)
 		return err
 	case <-instance.done:
 		return instance.finishedError("execute EasyTier command")
@@ -391,11 +440,13 @@ drain:
 
 	successful := false
 	var sendErrors [maximumPacketIngressBatch]error
+	instance.guestMu.Lock()
 	for index := 0; index < count; index++ {
-		err := instance.handleCommand(batch[index])
-		sendErrors[index] = err
-		successful = successful || err == nil
+		var sent bool
+		sent, sendErrors[index] = instance.sendPacketsLocked(batch[index])
+		successful = successful || sent
 	}
+	instance.guestMu.Unlock()
 	var driveErr error
 	if successful {
 		deadline, driveErr = instance.drive(false)
@@ -422,6 +473,27 @@ drain:
 	deadline, driveErr = instance.drive(false)
 	following.response <- driveErr
 	return deadline, driveErr
+}
+
+// sendPacketsLocked submits the packets of a send command and reports whether
+// the guest accepted any, with the first error.
+func (instance *Instance) sendPacketsLocked(request command) (bool, error) {
+	if request.packets == nil {
+		err := instance.core.SendPacket(instance.ctx, request.packet)
+		return err == nil, err
+	}
+	sent := false
+	var firstErr error
+	for _, packet := range request.packets {
+		if err := instance.core.SendPacket(instance.ctx, packet); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		sent = true
+	}
+	return sent, firstErr
 }
 
 func (instance *Instance) handleCommand(request command) error {
